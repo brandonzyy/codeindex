@@ -250,6 +250,7 @@ FILE_EXTENSIONS: Dict[str, str] = {
     ".tsx": "tsx",
     ".js": "javascript",
     ".jsx": "javascript",
+    ".mjs": "javascript",
 }
 
 # Parser cache for lazy loading (avoids re-initialization)
