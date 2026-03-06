@@ -826,6 +826,66 @@ class TypeScriptParser(BaseLanguageParser):
             for child in node.children:
                 self._extract_inheritances_from_node(child, source_bytes, inheritances)
 
+    # ==================== Import-Aware Call Resolution ====================
+
+    def _build_import_map(self, imports: list[Import]) -> dict[str, str]:
+        """Build local-name-to-module mapping from imports.
+
+        Examples:
+            import { X } from './module'       → { "X": "./module.X" }
+            import X from './module'           → { "X": "./module" }  (default)
+            import * as X from './module'      → { "X": "./module" }  (namespace)
+            const { X } = require('./module')  → { "X": "./module.X" }
+        """
+        import_map: dict[str, str] = {}
+        for imp in imports:
+            if imp.is_from and imp.names:
+                if imp.names == ["*"] and imp.alias:
+                    # Namespace import: import * as X from './module'
+                    import_map[imp.alias] = imp.module
+                elif len(imp.names) == 1 and imp.alias == imp.names[0]:
+                    # Default import: import X from './module'
+                    import_map[imp.alias] = imp.module
+                else:
+                    # Named imports: import { A, B } from './module'
+                    for name in imp.names:
+                        import_map[name] = f"{imp.module}.{name}"
+            elif not imp.is_from and imp.alias and imp.names:
+                # CommonJS: const { X } = require('./module') or const X = require('./module')
+                for name in imp.names:
+                    import_map[name] = f"{imp.module}.{name}"
+            elif not imp.is_from and imp.alias and not imp.names:
+                # CommonJS whole module: const X = require('./module')
+                import_map[imp.alias] = imp.module
+        return import_map
+
+    def _resolve_callee(self, callee: str, import_map: dict[str, str]) -> str:
+        """Resolve callee name using import map.
+
+        - Direct match: executeToolCall → ./tool-executor.executeToolCall
+        - Prefix match: LLMClient.chat → ./llm-client.LLMClient.chat
+        - Skip this.xxx / super.xxx (instance calls)
+        """
+        if not callee or not import_map:
+            return callee
+
+        # Skip this.xxx and super.xxx
+        if callee.startswith(("this.", "super.")):
+            return callee
+
+        # Direct match
+        if callee in import_map:
+            return import_map[callee]
+
+        # Prefix match: split on first dot
+        if "." in callee:
+            prefix, suffix = callee.split(".", 1)
+            if prefix in import_map:
+                resolved_prefix = import_map[prefix]
+                return f"{resolved_prefix}.{suffix}"
+
+        return callee
+
     # ==================== Call Extraction ====================
 
     def extract_calls(
@@ -834,15 +894,16 @@ class TypeScriptParser(BaseLanguageParser):
         """Extract function/method call relationships."""
         calls = []
         root = tree.root_node
+        import_map = self._build_import_map(imports)
 
-        # Build symbol context for caller resolution
         for child in root.children:
-            self._extract_calls_from_node(child, source_bytes, "", calls)
+            self._extract_calls_from_node(child, source_bytes, "", calls, import_map)
 
         return calls
 
     def _extract_calls_from_node(
-        self, node: Node, source_bytes: bytes, caller: str, calls: list[Call]
+        self, node: Node, source_bytes: bytes, caller: str, calls: list[Call],
+        import_map: dict[str, str] | None = None,
     ):
         """Recursively extract calls from AST nodes."""
         # Determine caller context
@@ -874,23 +935,23 @@ class TypeScriptParser(BaseLanguageParser):
                                 if method_name:
                                     method_caller = f"{class_name}.{method_name}"
                                     self._extract_calls_from_node(
-                                        body_child, source_bytes, method_caller, calls
+                                        body_child, source_bytes, method_caller, calls, import_map
                                     )
                 return
 
         elif node.type == "export_statement":
             for child in node.children:
-                self._extract_calls_from_node(child, source_bytes, caller, calls)
+                self._extract_calls_from_node(child, source_bytes, caller, calls, import_map)
             return
 
         # Extract call from current node
         if node.type == "call_expression":
-            call = self._parse_call_expression(node, source_bytes, current_caller)
+            call = self._parse_call_expression(node, source_bytes, current_caller, import_map)
             if call:
                 calls.append(call)
 
         elif node.type == "new_expression":
-            call = self._parse_new_expression(node, source_bytes, current_caller)
+            call = self._parse_new_expression(node, source_bytes, current_caller, import_map)
             if call:
                 calls.append(call)
 
@@ -898,10 +959,11 @@ class TypeScriptParser(BaseLanguageParser):
         for child in node.children:
             if child.type not in ("class_declaration", "abstract_class_declaration",
                                   "function_declaration", "generator_function_declaration"):
-                self._extract_calls_from_node(child, source_bytes, current_caller, calls)
+                self._extract_calls_from_node(child, source_bytes, current_caller, calls, import_map)
 
     def _parse_call_expression(
-        self, node: Node, source_bytes: bytes, caller: str
+        self, node: Node, source_bytes: bytes, caller: str,
+        import_map: dict[str, str] | None = None,
     ) -> Call | None:
         """Parse a call_expression node."""
         callee_text = ""
@@ -949,6 +1011,10 @@ class TypeScriptParser(BaseLanguageParser):
         if not callee_text:
             return None
 
+        # Resolve callee using import map
+        if import_map:
+            callee_text = self._resolve_callee(callee_text, import_map)
+
         # Count arguments
         args_count = None
         for child in node.children:
@@ -967,7 +1033,8 @@ class TypeScriptParser(BaseLanguageParser):
         )
 
     def _parse_new_expression(
-        self, node: Node, source_bytes: bytes, caller: str
+        self, node: Node, source_bytes: bytes, caller: str,
+        import_map: dict[str, str] | None = None,
     ) -> Call | None:
         """Parse a new_expression (constructor call)."""
         type_name = ""
@@ -982,6 +1049,10 @@ class TypeScriptParser(BaseLanguageParser):
 
         if not type_name:
             return None
+
+        # Resolve type name using import map
+        if import_map:
+            type_name = self._resolve_callee(type_name, import_map)
 
         args_count = None
         for child in node.children:

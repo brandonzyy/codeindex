@@ -51,6 +51,7 @@ LANGUAGE_EXTENSIONS = {
     "php": [".php", ".phtml"],
     "java": [".java"],
     "typescript": [".ts", ".tsx"],
+    "tsx": [".tsx"],
     "javascript": [".js", ".jsx"],
 }
 
