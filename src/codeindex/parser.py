@@ -241,6 +241,7 @@ class ParseResult:
 
 
 # File extension to language mapping
+# Languages with dedicated parsers (high-quality extraction)
 FILE_EXTENSIONS: Dict[str, str] = {
     ".py": "python",
     ".php": "php",
@@ -253,6 +254,59 @@ FILE_EXTENSIONS: Dict[str, str] = {
     ".mjs": "javascript",
 }
 
+# Extended extensions — parsed by GenericParser (good-enough extraction)
+# Only active when the corresponding tree-sitter package is installed.
+_GENERIC_EXTENSIONS: Dict[str, str] = {
+    # Go
+    ".go": "go",
+    # Rust
+    ".rs": "rust",
+    # C / C++
+    ".c": "c", ".h": "c",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
+    ".hpp": "cpp", ".hh": "cpp", ".hxx": "cpp",
+    # C#
+    ".cs": "c_sharp",
+    # Ruby
+    ".rb": "ruby",
+    # Swift
+    ".swift": "swift",
+    # Kotlin
+    ".kt": "kotlin", ".kts": "kotlin",
+    # Scala
+    ".scala": "scala",
+    # Lua
+    ".lua": "lua",
+    # R
+    ".r": "r", ".R": "r",
+    # Elixir
+    ".ex": "elixir", ".exs": "elixir",
+    # Dart
+    ".dart": "dart",
+    # Haskell
+    ".hs": "haskell",
+    # OCaml
+    ".ml": "ocaml", ".mli": "ocaml",
+    # Bash / Shell
+    ".sh": "bash", ".bash": "bash",
+    # Zig
+    ".zig": "zig",
+}
+
+# Languages that have a dedicated parser class (not GenericParser)
+_SPECIALIZED_LANGUAGES = {"python", "php", "java", "typescript", "tsx", "javascript"}
+
+
+def get_all_extensions() -> Dict[str, str]:
+    """Return combined FILE_EXTENSIONS + _GENERIC_EXTENSIONS for language detection.
+
+    Use this instead of FILE_EXTENSIONS when you want to detect all languages
+    that codeindex can potentially parse (specialized + generic).
+    """
+    combined = dict(FILE_EXTENSIONS)
+    combined.update(_GENERIC_EXTENSIONS)
+    return combined
+
 # Parser cache for lazy loading (avoids re-initialization)
 _PARSER_CACHE: Dict[str, Parser] = {}
 
@@ -260,79 +314,94 @@ _PARSER_CACHE: Dict[str, Parser] = {}
 def _get_parser(language: str) -> Parser | None:
     """Get or create a parser for the specified language (lazy loading).
 
-    This function implements lazy loading to avoid importing all language
-    parsers at module load time. Only the needed parser is imported and
-    initialized when first used.
+    Supports both specialized languages (hardcoded imports with known API
+    quirks) and generic languages (dynamic import of tree_sitter_{language}).
 
     Args:
-        language: Language name ("python", "php", "java")
+        language: Language name ("python", "php", "java", "go", "rust", etc.)
 
     Returns:
-        Parser instance for the language, or None if unsupported
-
-    Raises:
-        ImportError: If the tree-sitter library for the language is not installed
-
-    Example:
-        parser = _get_parser("python")  # Only imports tree-sitter-python
+        Parser instance for the language, or None if unsupported/not installed
     """
     # Return cached parser if available
     if language in _PARSER_CACHE:
         return _PARSER_CACHE[language]
 
-    # Lazy import and initialize parser based on language
+    lang_obj = _load_language(language)
+    if lang_obj is None:
+        return None
+
+    parser = Parser(lang_obj)
+    _PARSER_CACHE[language] = parser
+    return parser
+
+
+# Sentinel for languages we already tried and failed to load
+_LOAD_FAILED: set[str] = set()
+
+
+def _load_language(language: str) -> Language | None:
+    """Load a tree-sitter Language object for the given language name.
+
+    Handles known API quirks (e.g., PHP's language_php(), TypeScript's
+    language_typescript()) and falls back to dynamic import for others.
+    """
+    if language in _LOAD_FAILED:
+        return None
+
     try:
+        # ── Specialized languages with known API quirks ──
         if language == "python":
-            import tree_sitter_python as tspython
-
-            lang = Language(tspython.language())
+            import tree_sitter_python as ts_mod
+            return Language(ts_mod.language())
         elif language == "php":
-            import tree_sitter_php as tsphp
-
-            lang = Language(tsphp.language_php())
+            import tree_sitter_php as ts_mod
+            return Language(ts_mod.language_php())
         elif language == "java":
-            import tree_sitter_java as tsjava
-
-            lang = Language(tsjava.language())
+            import tree_sitter_java as ts_mod
+            return Language(ts_mod.language())
         elif language == "typescript":
-            import tree_sitter_typescript as ts_ts
-
-            lang = Language(ts_ts.language_typescript())
+            import tree_sitter_typescript as ts_mod
+            return Language(ts_mod.language_typescript())
         elif language == "tsx":
-            import tree_sitter_typescript as ts_ts
-
-            lang = Language(ts_ts.language_tsx())
+            import tree_sitter_typescript as ts_mod
+            return Language(ts_mod.language_tsx())
         elif language == "javascript":
-            import tree_sitter_javascript as ts_js
+            import tree_sitter_javascript as ts_mod
+            return Language(ts_mod.language())
 
-            lang = Language(ts_js.language())
-        else:
-            return None
+        # ── Dynamic loading for any other language ──
+        import importlib
+        # tree-sitter packages use underscores: tree_sitter_go, tree_sitter_rust, etc.
+        mod_name = f"tree_sitter_{language}"
+        ts_mod = importlib.import_module(mod_name)
 
-        # Create and cache parser
-        parser = Parser(lang)
-        _PARSER_CACHE[language] = parser
-        return parser
+        # Try common function name patterns:
+        #   language()           — most packages (go, rust, c, ruby, swift, ...)
+        #   language_{name}()    — some packages (php → language_php)
+        for func_name in ("language", f"language_{language}"):
+            func = getattr(ts_mod, func_name, None)
+            if callable(func):
+                return Language(func())
 
-    except ImportError as e:
-        # Provide helpful error message
-        raise ImportError(
-            f"tree-sitter-{language} is not installed. "
-            f"Install it with: pip install tree-sitter-{language}"
-        ) from e
+        _LOAD_FAILED.add(language)
+        return None
+
+    except ImportError:
+        _LOAD_FAILED.add(language)
+        return None
 
 
 def parse_file(path: Path, language: str | None = None) -> ParseResult:
     """Parse a source file and extract symbols and imports.
 
-    Epic 13, Phase 3: Simplified entry point that delegates to language parsers.
-    Supports Python, PHP, Java, TypeScript, and JavaScript.
+    Supports two tiers:
+    - Specialized parsers (Python, PHP, Java, TypeScript, JavaScript) — high quality
+    - GenericParser (Go, Rust, C, C++, Swift, Kotlin, etc.) — good enough
 
     Args:
         path: Path to the source file
-        language: Optional language override ("python", "php", "java",
-                  "typescript", "tsx", "javascript").
-                  If None, language is detected from file extension.
+        language: Optional language override. If None, detected from extension.
 
     Returns:
         ParseResult containing symbols, imports, calls, inheritances, and docstrings
@@ -342,7 +411,6 @@ def parse_file(path: Path, language: str | None = None) -> ParseResult:
         language = _get_language(path)
 
     if not language:
-        # Read file to get line count for error reporting
         try:
             file_lines = path.read_bytes().count(b"\n") + 1
         except Exception:
@@ -352,34 +420,30 @@ def parse_file(path: Path, language: str | None = None) -> ParseResult:
         )
 
     # Get tree-sitter parser (lazy loading)
-    try:
-        parser = _get_parser(language)
-    except ImportError as e:
-        # Read file to get line count
+    parser = _get_parser(language)
+    if not parser:
         try:
             file_lines = path.read_bytes().count(b"\n") + 1
         except Exception:
             file_lines = 0
-        return ParseResult(path=path, error=str(e), file_lines=file_lines)
+        return ParseResult(path=path, error=f"Parser not available for {language}", file_lines=file_lines)
 
-    if not parser:
-        return ParseResult(path=path, error=f"Unsupported language: {language}", file_lines=0)
+    # Delegate to specialized parser if available, otherwise GenericParser
+    if language in _SPECIALIZED_LANGUAGES:
+        from .parsers import JavaParser, PhpParser, PythonParser, TypeScriptParser
 
-    # Delegate to language-specific parser (Epic 13 refactoring)
-    from .parsers import JavaParser, PhpParser, PythonParser, TypeScriptParser
-
-    if language == "python":
-        lang_parser = PythonParser(parser)
-    elif language == "php":
-        lang_parser = PhpParser(parser)
-    elif language == "java":
-        lang_parser = JavaParser(parser)
-    elif language in ("typescript", "tsx", "javascript"):
-        lang_parser = TypeScriptParser(parser, grammar_name=language)
+        if language == "python":
+            lang_parser = PythonParser(parser)
+        elif language == "php":
+            lang_parser = PhpParser(parser)
+        elif language == "java":
+            lang_parser = JavaParser(parser)
+        else:  # typescript, tsx, javascript
+            lang_parser = TypeScriptParser(parser, grammar_name=language)
     else:
-        return ParseResult(path=path, error=f"Unsupported language: {language}", file_lines=0)
+        from .parsers import GenericParser
+        lang_parser = GenericParser(parser, language=language)
 
-    # Use language parser's parse method
     return lang_parser.parse(path)
 
 
@@ -388,7 +452,23 @@ def parse_directory(paths: list[Path]) -> list[ParseResult]:
     return [parse_file(p) for p in paths]
 
 
-def _get_language(file_path: Path) -> str:
-    """Determine language from file extension."""
-    suffix = file_path.suffix.lower()
-    return FILE_EXTENSIONS.get(suffix)
+def _get_language(file_path: Path) -> str | None:
+    """Determine language from file extension.
+
+    Checks specialized extensions first, then generic extensions.
+    Generic extensions only resolve if the tree-sitter package is installed.
+    """
+    suffix = file_path.suffix
+    # Check case-sensitive first (for .R), then lowercase
+    lang = FILE_EXTENSIONS.get(suffix) or FILE_EXTENSIONS.get(suffix.lower())
+    if lang:
+        return lang
+
+    # Check generic extensions — only if parser is loadable
+    generic_lang = _GENERIC_EXTENSIONS.get(suffix) or _GENERIC_EXTENSIONS.get(suffix.lower())
+    if generic_lang and generic_lang not in _LOAD_FAILED:
+        # Verify the parser can actually be loaded (package installed)
+        if _get_parser(generic_lang) is not None:
+            return generic_lang
+
+    return None

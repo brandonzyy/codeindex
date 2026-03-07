@@ -8,6 +8,7 @@ from typing import Dict, Set
 log = logging.getLogger("codeindex.parser_installer")
 
 # Language -> pip package mapping
+# Specialized parsers (high-quality extraction)
 LANG_TO_PACKAGE = {
     "python": "tree-sitter-python",
     "javascript": "tree-sitter-javascript",
@@ -15,6 +16,24 @@ LANG_TO_PACKAGE = {
     "tsx": "tree-sitter-typescript",
     "php": "tree-sitter-php",
     "java": "tree-sitter-java",
+    # Generic parsers (good-enough extraction via GenericParser)
+    "go": "tree-sitter-go",
+    "rust": "tree-sitter-rust",
+    "c": "tree-sitter-c",
+    "cpp": "tree-sitter-cpp",
+    "c_sharp": "tree-sitter-c-sharp",
+    "ruby": "tree-sitter-ruby",
+    "swift": "tree-sitter-swift",
+    "kotlin": "tree-sitter-kotlin",
+    "scala": "tree-sitter-scala",
+    "lua": "tree-sitter-lua",
+    "r": "tree-sitter-r",
+    "elixir": "tree-sitter-elixir",
+    "dart": "tree-sitter-dart",
+    "haskell": "tree-sitter-haskell",
+    "ocaml": "tree-sitter-ocaml",
+    "bash": "tree-sitter-bash",
+    "zig": "tree-sitter-zig",
 }
 
 # Pip mirrors for faster installation
@@ -26,20 +45,18 @@ PIP_MIRRORS = [
 
 
 def check_parser_installed(language: str) -> bool:
-    """Check if tree-sitter parser is installed."""
+    """Check if tree-sitter parser is installed.
+
+    Dynamically checks for the corresponding tree_sitter_{language} module.
+    Handles special cases like tsx → tree_sitter_typescript.
+    """
+    # Map language to Python module name
+    if language in ("typescript", "tsx"):
+        mod_name = "tree_sitter_typescript"
+    else:
+        mod_name = f"tree_sitter_{language}"
     try:
-        if language in ("typescript", "tsx"):
-            __import__("tree_sitter_typescript")
-        elif language == "javascript":
-            __import__("tree_sitter_javascript")
-        elif language == "python":
-            __import__("tree_sitter_python")
-        elif language == "php":
-            __import__("tree_sitter_php")
-        elif language == "java":
-            __import__("tree_sitter_java")
-        else:
-            return False
+        __import__(mod_name)
         return True
     except ImportError:
         return False
